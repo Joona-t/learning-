@@ -1,0 +1,222 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: "Dry run — validate and preview without publishing or committing"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: ${{ inputs.dry_run && 'dry run' || 'bump, validate, publish' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Validate changelog has vNEXT content
+        run: |
+          python3 -c "
+          import re, pathlib, sys
+          text = pathlib.Path('CHANGELOG.md').read_text()
+          match = re.search(r'^## vNEXT\s*\n(.*?)(?=^## v|\Z)', text, re.M | re.S)
+          if not match:
+              print('ERROR: No ## vNEXT section found in CHANGELOG.md.', file=sys.stderr)
+              print('Add your changes under ## vNEXT before releasing.', file=sys.stderr)
+              sys.exit(1)
+          body = match.group(1).strip()
+          if not body:
+              print('ERROR: ## vNEXT section in CHANGELOG.md is empty.', file=sys.stderr)
+              print('Add release notes under ## vNEXT before releasing.', file=sys.stderr)
+              sys.exit(1)
+          print(f'Changelog content found ({len(body.splitlines())} lines)')
+          "
+
+      - name: Bump version and rename changelog
+        id: bump
+        run: |
+          python3 -c "
+          import re, pathlib, sys
+
+          bump = '${{ inputs.bump }}'
+
+          # Read current version from pyproject.toml
+          pyproject = pathlib.Path('pyproject.toml')
+          text = pyproject.read_text()
+          match = re.search(r'^version\s*=\s*\"(\d+)\.(\d+)\.(\d+)\"', text, re.M)
+          if not match:
+              print('ERROR: Could not parse version from pyproject.toml', file=sys.stderr)
+              sys.exit(1)
+
+          major, minor, patch = int(match.group(1)), int(match.group(2)), int(match.group(3))
+          old_version = f'{major}.{minor}.{patch}'
+
+          if bump == 'major':
+              major += 1; minor = 0; patch = 0
+          elif bump == 'minor':
+              minor += 1; patch = 0
+          else:
+              patch += 1
+
+          new_version = f'{major}.{minor}.{patch}'
+          print(f'Bumping {old_version} -> {new_version} ({bump})')
+
+          # Update pyproject.toml
+          text = re.sub(r'^(version\s*=\s*\")[\d.]+\"', rf'\g<1>{new_version}\"', text, count=1, flags=re.M)
+          pyproject.write_text(text)
+
+          # Update package.json
+          pkg = pathlib.Path('package.json')
+          pkg_text = pkg.read_text()
+          pkg_text = re.sub(r'(\"version\":\s*\")[\d.]+\"', rf'\g<1>{new_version}\"', pkg_text, count=1)
+          pkg_text = re.sub(r'(\"gpdPythonVersion\":\s*\")[\d.]+\"', rf'\g<1>{new_version}\"', pkg_text, count=1)
+          pkg.write_text(pkg_text)
+
+          # Rename vNEXT -> vX.Y.Z in CHANGELOG.md
+          changelog = pathlib.Path('CHANGELOG.md')
+          cl_text = changelog.read_text()
+          cl_text = cl_text.replace('## vNEXT', f'## v{new_version}', 1)
+
+          # Add fresh vNEXT section at the top (after header)
+          cl_text = cl_text.replace(f'## v{new_version}', f'## vNEXT\n\n## v{new_version}', 1)
+          changelog.write_text(cl_text)
+          "
+
+          VERSION=$(python3 -c "
+          import re, pathlib
+          text = pathlib.Path('pyproject.toml').read_text()
+          match = re.search(r'^version\s*=\s*\"([^\"]+)\"', text, re.M)
+          print(match.group(1))
+          ")
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract changelog body for release notes
+        id: changelog
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+          python3 -c "
+          import re, pathlib, sys
+          text = pathlib.Path('CHANGELOG.md').read_text()
+          headings = list(re.finditer(r'^## v(\S+)', text, re.M))
+          for i, h in enumerate(headings):
+              if h.group(1) == '${VERSION}':
+                  start = h.end()
+                  end = headings[i+1].start() if i+1 < len(headings) else len(text)
+                  body = text[start:end].strip()
+                  print(body)
+                  sys.exit(0)
+          print(f'ERROR: Could not find ## v${VERSION} in CHANGELOG.md', file=sys.stderr)
+          sys.exit(1)
+          " > /tmp/release-notes.txt
+
+          {
+            echo "body<<CHANGELOG_EOF"
+            cat /tmp/release-notes.txt
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check tag does not already exist
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag v${VERSION} already exists."
+            exit 1
+          fi
+
+      - name: Dry run summary
+        if: inputs.dry_run
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+          echo ""
+          echo "==========================================="
+          echo "  DRY RUN — nothing was published or committed"
+          echo "==========================================="
+          echo ""
+          echo "  Version:     v${VERSION}"
+          echo "  Bump type:   ${{ inputs.bump }}"
+          echo "  Tag:         v${VERSION} (does not exist yet — good)"
+          echo ""
+          echo "  Files that would be modified:"
+          echo "    - pyproject.toml  (version = \"${VERSION}\")"
+          echo "    - package.json    (version + gpdPythonVersion = \"${VERSION}\")"
+          echo "    - CHANGELOG.md    (## vNEXT renamed to ## v${VERSION})"
+          echo ""
+          echo "  Release notes:"
+          echo "  ---"
+          cat /tmp/release-notes.txt
+          echo "  ---"
+          echo ""
+          echo "  Would publish to: PyPI, npm"
+          echo "  Would create: git tag v${VERSION}, GitHub Release v${VERSION}"
+          echo ""
+
+      - name: Commit version bump
+        if: ${{ !inputs.dry_run }}
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml package.json CHANGELOG.md
+          git commit -m "release: v${VERSION}"
+          git push
+
+      - name: Build Python package
+        if: ${{ !inputs.dry_run }}
+        run: |
+          pip install build
+          python -m build
+
+      - name: Publish to PyPI
+        if: ${{ !inputs.dry_run }}
+        run: |
+          pip install twine
+          twine upload dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+
+      - name: Publish to npm
+        if: ${{ !inputs.dry_run }}
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create tag and GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.bump.outputs.version }}"
+          git tag "v${VERSION}"
+          git push origin "v${VERSION}"
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes-file /tmp/release-notes.txt
